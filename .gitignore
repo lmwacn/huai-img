@@ -1,0 +1,44 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg
+*.whl
+
+# Packaging
+dist/
+build/
+*.egg-info/
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+env/
+
+# IDE / Editor
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Project outputs
+outputs/
+
+# Codex generated images
+.codex/
+
+# Claude Code local settings
+.claude/
