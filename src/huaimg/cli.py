@@ -39,7 +39,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     serve_parser = subparsers.add_parser("serve", help="Start LAN API server")
     serve_parser.add_argument("--host", default=None, help=f"Bind address (default: 0.0.0.0)")
-    serve_parser.add_argument("--port", type=int, default=None, help=f"Port (default: 8080)")
+    serve_parser.add_argument("--port", type=int, default=None, help="Port (default: 9527)")
+    serve_parser.add_argument("--debug", action="store_true", help="Enable verbose API/backend debug logs")
 
     return parser
 
@@ -133,7 +134,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "probe":
             return handle_probe(args)
         if args.command == "serve":
-            serve_api(host=args.host, port=args.port)
+            serve_api(host=args.host, port=args.port, debug=args.debug)
             return 0
         parser.error(f"Unknown command: {args.command}")
         return 2

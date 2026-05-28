@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import base64
+import inspect
 import json
 import os
 import re
 import tempfile
 import time
+import traceback
 import uuid
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
@@ -18,6 +21,15 @@ from .storyboard import run_storyboard_from_data
 DEFAULT_HOST = "0.0.0.0"
 DEFAULT_PORT = 9527
 OUTPUT_DIR = Path("outputs/api")
+
+
+def _debug_enabled() -> bool:
+    return os.getenv("HUAIMG_DEBUG", "0").lower() not in ("0", "false", "no", "off")
+
+
+def _debug(message: str) -> None:
+    if _debug_enabled():
+        print(f"[huaimg-api] {message}", flush=True)
 
 
 def _ensure_output_dir() -> None:
@@ -475,9 +487,68 @@ def _json_response(handler: BaseHTTPRequestHandler, status: int, data: object) -
     handler.wfile.write(body)
 
 
+def _openai_error_response(
+    handler: BaseHTTPRequestHandler,
+    status: int,
+    message: str,
+    *,
+    error_type: str = "invalid_request_error",
+    param: str | None = None,
+    code: str | None = None,
+) -> None:
+    _json_response(
+        handler,
+        status,
+        {
+            "error": {
+                "message": message,
+                "type": error_type,
+                "param": param,
+                "code": code,
+            }
+        },
+    )
+
+
 def _base_url(handler: BaseHTTPRequestHandler) -> str:
     host_header = handler.headers.get("Host", f"localhost:{DEFAULT_PORT}")
     return f"http://{host_header}"
+
+
+def _append_openai_options(prompt: str, data: dict) -> str:
+    hints = []
+    size = data.get("size")
+    quality = data.get("quality")
+    if size and str(size) != "auto":
+        hints.append(f"Requested image size/aspect: {size}")
+    if quality and str(quality) != "auto":
+        hints.append(f"Requested quality: {quality}")
+    if not hints:
+        return prompt
+    return f"{prompt}\n\n" + "\n".join(hints)
+
+
+def _image_path_from_result(result_output: str | None, fallback: Path) -> Path | None:
+    if fallback.exists():
+        return fallback
+    if result_output:
+        path = Path(result_output)
+        if path.exists() and path.is_file():
+            return path
+    return None
+
+
+def _copy_into_api_output(source: Path, destination: Path) -> Path:
+    if source.resolve() == destination.resolve():
+        return destination
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.write_bytes(source.read_bytes())
+    return destination
+
+
+def _log_exception(context: str, exc: BaseException) -> None:
+    print(f"[huaimg-api] {context}: {type(exc).__name__}: {exc}", flush=True)
+    traceback.print_exc()
 
 
 class HuaimgHandler(BaseHTTPRequestHandler):
@@ -491,7 +562,7 @@ class HuaimgHandler(BaseHTTPRequestHandler):
         self.send_response(204)
         self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type")
+        self.send_header("Access-Control-Allow-Headers", "Authorization, Content-Type")
         self.send_header("Access-Control-Max-Age", "86400")
         self.end_headers()
 
@@ -505,6 +576,10 @@ class HuaimgHandler(BaseHTTPRequestHandler):
             self._handle_health()
         elif parsed.path == "/api/probe":
             self._handle_probe()
+        elif parsed.path == "/v1/models":
+            self._handle_openai_models()
+        elif parsed.path == "/__debug/routes" and _debug_enabled():
+            self._handle_debug_routes()
         elif parsed.path == "/api/images/list":
             self._handle_image_list()
         elif parsed.path.startswith("/api/images/"):
@@ -541,6 +616,46 @@ class HuaimgHandler(BaseHTTPRequestHandler):
         result = probe_backends()
         _json_response(self, 200, result.to_dict())
 
+    def _handle_openai_models(self) -> None:
+        _json_response(
+            self,
+            200,
+            {
+                "object": "list",
+                "data": [
+                    {
+                        "id": "gpt-image-2",
+                        "object": "model",
+                        "created": 0,
+                        "owned_by": "huaimg",
+                    },
+                    {
+                        "id": "gpt-image-1",
+                        "object": "model",
+                        "created": 0,
+                        "owned_by": "huaimg",
+                    },
+                ],
+            },
+        )
+
+    def _handle_debug_routes(self) -> None:
+        _json_response(
+            self,
+            200,
+            {
+                "source": str(Path(__file__).resolve()),
+                "debug": os.getenv("HUAIMG_DEBUG", "0"),
+                "post_routes": [
+                    "/api/generate",
+                    "/v1/images/generations",
+                    "/api/storyboard",
+                    "/api/upload",
+                ],
+                "do_post_source": inspect.getsource(self.do_POST),
+            },
+        )
+
     def _handle_image_download(self, path: str) -> None:
         # Extract everything after /api/images/
         rel_path = path[len("/api/images/"):]
@@ -571,8 +686,11 @@ class HuaimgHandler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         parsed = urlparse(self.path)
+        _debug(f"POST {parsed.path}")
         if parsed.path == "/api/generate":
             self._handle_generate()
+        elif parsed.path == "/v1/images/generations":
+            self._handle_openai_image_generation()
         elif parsed.path == "/api/storyboard":
             self._handle_storyboard()
         elif parsed.path == "/api/upload":
@@ -589,6 +707,7 @@ class HuaimgHandler(BaseHTTPRequestHandler):
     def _handle_generate(self) -> None:
         _ensure_output_dir()
         content_type = self.headers.get("Content-Type", "")
+        _debug("/api/generate request received")
 
         try:
             prompt: str = ""
@@ -671,7 +790,106 @@ class HuaimgHandler(BaseHTTPRequestHandler):
             _json_response(self, status, result_dict)
 
         except (ValueError, BackendError, OSError) as e:
+            _log_exception("/api/generate failed", e)
             _json_response(self, 400, {"success": False, "error": str(e)})
+        except Exception as e:
+            _log_exception("/api/generate crashed", e)
+            _json_response(self, 500, {"success": False, "error": str(e)})
+
+    def _handle_openai_image_generation(self) -> None:
+        _ensure_output_dir()
+        content_type = self.headers.get("Content-Type", "")
+        _debug("OpenAI-compatible generation request received")
+
+        if "application/json" not in content_type:
+            _openai_error_response(
+                self,
+                400,
+                "Unsupported Content-Type, use application/json",
+                param="Content-Type",
+            )
+            return
+
+        try:
+            body = self._read_body()
+            data = json.loads(body or b"{}")
+            if not isinstance(data, dict):
+                raise ValueError("Request body must be a JSON object")
+
+            prompt = str(data.get("prompt", "")).strip()
+            if not prompt:
+                _openai_error_response(self, 400, "prompt is required", param="prompt")
+                return
+
+            response_format = str(data.get("response_format", "url"))
+            if response_format not in ("url", "b64_json"):
+                _openai_error_response(
+                    self,
+                    400,
+                    "response_format must be one of: url, b64_json",
+                    param="response_format",
+                )
+                return
+
+            n = int(data.get("n", 1))
+            if n < 1 or n > 10:
+                _openai_error_response(self, 400, "n must be between 1 and 10", param="n")
+                return
+
+            mode = str(data.get("mode", "auto"))
+            timeout = int(data.get("timeout", 180))
+            style = data.get("style")
+            merged_prompt = _append_openai_options(prompt, data)
+            created = int(time.time())
+            image_items: list[dict[str, str]] = []
+
+            for index in range(n):
+                output_filename = f"{uuid.uuid4().hex}.png"
+                output_path = OUTPUT_DIR / output_filename
+                _debug(f"Generating OpenAI-compatible image {index + 1}/{n}...")
+                request = GenerateRequest(
+                    prompt=merged_prompt,
+                    mode=mode,
+                    references=[],
+                    output=output_path,
+                    style=str(style) if style else None,
+                    timeout=timeout,
+                )
+                result = generate_image(request)
+                if not result.success:
+                    raise BackendError(result.error or "image generation failed")
+
+                image_path = _image_path_from_result(result.output, output_path)
+                if image_path is None:
+                    raise BackendError("image generation completed but no output image was found")
+
+                if response_format == "b64_json":
+                    image_items.append({
+                        "b64_json": base64.b64encode(image_path.read_bytes()).decode("ascii")
+                    })
+                else:
+                    downloadable = _copy_into_api_output(image_path, output_path)
+                    image_items.append({
+                        "url": f"{_base_url(self)}/api/images/{downloadable.name}"
+                    })
+
+            _debug(f"OpenAI-compatible generation completed: {len(image_items)} image(s)")
+            response: dict[str, object] = {
+                "created": created,
+                "data": image_items,
+            }
+
+            _json_response(self, 200, response)
+
+        except json.JSONDecodeError as e:
+            _log_exception("OpenAI-compatible request JSON parse failed", e)
+            _openai_error_response(self, 400, "Invalid JSON request body")
+        except (ValueError, BackendError, OSError) as e:
+            _log_exception("OpenAI-compatible generation failed", e)
+            _openai_error_response(self, 500 if isinstance(e, BackendError) else 400, str(e))
+        except Exception as e:
+            _log_exception("OpenAI-compatible generation crashed", e)
+            _openai_error_response(self, 500, str(e), error_type="server_error")
 
     def _handle_storyboard(self) -> None:
         _ensure_output_dir()
@@ -794,21 +1012,31 @@ def _resolve_storyboard_refs(data: dict) -> dict:
     return resolved
 
 
-def serve(host: str | None = None, port: int | None = None) -> None:
+def serve(host: str | None = None, port: int | None = None, debug: bool | None = None) -> None:
     host = host or os.getenv("HUAIMG_HOST", DEFAULT_HOST)
     port = port or int(os.getenv("HUAIMG_PORT", str(DEFAULT_PORT)))
+    if debug is not None:
+        os.environ["HUAIMG_DEBUG"] = "1" if debug else "0"
     _ensure_output_dir()
 
     server = ThreadingHTTPServer((host, port), HuaimgHandler)
     print(f"[huaimg-api] Web UI:  http://{host}:{port}/")
     print(f"[huaimg-api] API:     http://{host}:{port}/api/")
+    if _debug_enabled():
+        print(f"[huaimg-api] Source:  {Path(__file__).resolve()}")
+        print(f"[huaimg-api] Debug:   {os.getenv('HUAIMG_DEBUG', '0')}")
+        print(f"[huaimg-api] do_POST: {inspect.getsource(HuaimgHandler.do_POST).strip().replace(chr(10), ' ')}")
     print(f"[huaimg-api] Endpoints:")
     print(f"  GET  /                 Web UI")
     print(f"  GET  /api/health       Health check")
     print(f"  GET  /api/probe        Backend probe")
+    print(f"  GET  /v1/models        OpenAI-compatible model list")
+    if _debug_enabled():
+        print(f"  GET  /__debug/routes   Debug route info")
     print(f"  GET  /api/images/list  List generated images")
     print(f"  GET  /api/images/<f>   Download image")
     print(f"  POST /api/generate     Generate image (JSON / multipart)")
+    print(f"  POST /v1/images/generations  OpenAI-compatible image generation")
     print(f"  POST /api/storyboard   Batch generation (JSON)")
     print(f"  POST /api/upload       Upload file (multipart)")
     print(f"[huaimg-api] Output: {OUTPUT_DIR.resolve()}")

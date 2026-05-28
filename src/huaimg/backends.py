@@ -19,6 +19,11 @@ class BackendError(RuntimeError):
     pass
 
 
+def _debug(message: str) -> None:
+    if os.getenv("HUAIMG_DEBUG", "0").lower() not in ("0", "false", "no", "off"):
+        print(f"[huaimg-backend] {message}", flush=True)
+
+
 def _clean_codex_error(output: str) -> str:
     """Extract the final meaningful error from codex output, removing noisy repeated lines."""
     lines = output.strip().splitlines()
@@ -115,17 +120,24 @@ class HttpBackend:
         if request.references:
             payload["images"] = [str(path) for path in request.references]
 
+        _debug(f"POST {self.service_url}/v1/images/generations payload={_format_backend_payload(payload)}")
         job = self._post_json(f"{self.service_url}/v1/images/generations", payload)
-        job_id = (((job or {}).get("job") or {}).get("id"))
+        _debug(f"generation response type={type(job).__name__} body={_format_backend_payload(job)}")
+        job_id = _extract_job_id(job)
         if not job_id:
-            raise BackendError("HTTP backend did not return a job id")
+            raise BackendError(f"HTTP backend did not return a job id: {_format_backend_payload(job)}")
 
         deadline = time.time() + request.timeout
         current_job_id = str(job_id)
         while time.time() < deadline:
             time.sleep(POLL_INTERVAL_SECONDS)
             job_response = self._get_json(f"{self.service_url}/v1/jobs/{current_job_id}")
-            job_data = (job_response or {}).get("job") or {}
+            _debug(f"GET {self.service_url}/v1/jobs/{current_job_id} type={type(job_response).__name__} body={_format_backend_payload(job_response)}")
+            if not isinstance(job_response, dict):
+                raise BackendError(f"HTTP backend returned an invalid job payload: {_format_backend_payload(job_response)}")
+            job_data = job_response.get("job") or {}
+            if not isinstance(job_data, dict):
+                raise BackendError(f"HTTP backend returned an invalid job payload: {_format_backend_payload(job_response)}")
             status = job_data.get("status")
 
             if status == "completed":
@@ -157,12 +169,12 @@ class HttpBackend:
 
         raise BackendError(f"HTTP generation timed out after {request.timeout} seconds")
 
-    def _get_json(self, url: str) -> dict:
+    def _get_json(self, url: str) -> object:
         request = Request(url, method="GET")
         with urlopen(request, timeout=10) as response:
             return json.loads(response.read().decode("utf-8"))
 
-    def _post_json(self, url: str, payload: dict[str, object]) -> dict:
+    def _post_json(self, url: str, payload: dict[str, object]) -> object:
         request = Request(
             url,
             data=json.dumps(payload).encode("utf-8"),
@@ -171,6 +183,30 @@ class HttpBackend:
         )
         with urlopen(request, timeout=10) as response:
             return json.loads(response.read().decode("utf-8"))
+
+
+def _extract_job_id(response: object) -> str | None:
+    if isinstance(response, str):
+        return response
+    if not isinstance(response, dict):
+        return None
+
+    job = response.get("job")
+    if isinstance(job, dict):
+        job_id = job.get("id")
+        return str(job_id) if job_id else None
+    if isinstance(job, str):
+        return job
+
+    job_id = response.get("id")
+    return str(job_id) if job_id else None
+
+
+def _format_backend_payload(payload: object) -> str:
+    try:
+        return json.dumps(payload, ensure_ascii=False)
+    except TypeError:
+        return str(payload)
 
 
 def service_url_from_env() -> str:
