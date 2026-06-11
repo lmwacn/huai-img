@@ -12,7 +12,9 @@ class GenerateRequest:
     references: list[Path] = field(default_factory=list)
     output: Path | None = None
     style: str | None = None
-    timeout: int = 180
+    ratio: str | None = None
+    timeout: int = 600
+    refine: bool = False
 
 
 @dataclass(slots=True)

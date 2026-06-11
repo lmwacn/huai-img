@@ -1,10 +1,21 @@
 from __future__ import annotations
 
-from .backends import BackendError, CliBackend, HttpBackend, service_url_from_env
+from .backends import BackendError, CliBackend, HttpBackend, refine_prompt, service_url_from_env
 from .models import GenerateRequest, GenerateResult
 
 
 def generate_image(request: GenerateRequest) -> GenerateResult:
+    # Refine prompt if requested
+    if request.refine:
+        refined = refine_prompt(
+            prompt=request.prompt,
+            references=request.references,
+            style=request.style,
+            ratio=request.ratio,
+        )
+        if refined != request.prompt:
+            request.prompt = refined
+
     mode = request.mode.lower()
     service_url = service_url_from_env()
     http_backend = HttpBackend(service_url)

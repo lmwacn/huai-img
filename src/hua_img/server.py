@@ -13,7 +13,7 @@ from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from pathlib import Path
 from urllib.parse import urlparse, unquote
 
-from .backends import BackendError, probe_backends
+from .backends import BackendError, probe_backends, refine_prompt
 from .generator import generate_image
 from .models import GenerateRequest
 from .storyboard import run_storyboard_from_data
@@ -21,19 +21,26 @@ from .storyboard import run_storyboard_from_data
 DEFAULT_HOST = "0.0.0.0"
 DEFAULT_PORT = 9527
 OUTPUT_DIR = Path("outputs/api")
+HISTORY_FILE = OUTPUT_DIR / "history.jsonl"
 
 
 def _debug_enabled() -> bool:
-    return os.getenv("HUAIMG_DEBUG", "0").lower() not in ("0", "false", "no", "off")
+    return os.getenv("HUA_IMG_DEBUG", "0").lower() not in ("0", "false", "no", "off")
 
 
 def _debug(message: str) -> None:
     if _debug_enabled():
-        print(f"[huaimg-api] {message}", flush=True)
+        print(f"[hua-img-api] {message}", flush=True)
 
 
 def _ensure_output_dir() -> None:
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def _record_history(entry: dict) -> None:
+    _ensure_output_dir()
+    with open(HISTORY_FILE, "a", encoding="utf-8") as f:
+        f.write(json.dumps(entry, ensure_ascii=False) + "\n")
 
 
 HTML_PAGE = r"""<!DOCTYPE html>
@@ -41,7 +48,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>huaimg</title>
+<title>hua-img — 花下客</title>
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
 :root{--bg:#1a1a2e;--surface:#16213e;--surface2:#0f3460;--accent:#e94560;--text:#eee;--text2:#aab;--radius:8px}
@@ -66,16 +73,21 @@ textarea{min-height:160px;font-family:monospace;font-size:13px;resize:vertical}
 .btn-secondary{background:var(--surface2);color:var(--text)}.btn-secondary:hover{background:#1a4a8a}
 .btn:disabled{opacity:.5;cursor:not-allowed}
 .btn-loading{position:relative;padding-left:40px;min-width:200px}
-.btn-loading .spinner{position:absolute;left:12px;top:50%;transform:translateY(-50%);width:20px;height:20px;border:2px solid #fff4;border-top-color:#fff;border-radius:50%;animation:spin .7s linear infinite}
+.btn-loading .spinner{position:absolute;left:12px;top:calc(50% - 10px);width:20px;height:20px;border:2px solid #fff4;border-top-color:#fff;border-radius:50%;animation:spin .7s linear infinite}
 .field{margin-bottom:16px}
 .row{display:flex;gap:12px;align-items:end}
 .row>*{flex:1}
-.file-drop{border:2px dashed #ffffff20;border-radius:var(--radius);padding:24px;text-align:center;color:var(--text2);cursor:pointer;transition:all .2s}
+.file-drop{border:2px dashed #ffffff20;border-radius:var(--radius);padding:24px;min-height:120px;text-align:center;color:var(--text2);cursor:pointer;transition:all .2s}
 .file-drop:hover,.file-drop.dragover{border-color:var(--accent);background:#e9456010}
 .file-drop input{display:none}
+.global-drop-overlay{display:none;position:fixed;inset:0;background:rgba(26,26,46,.92);z-index:200;align-items:center;justify-content:center;pointer-events:none}
+.global-drop-overlay.show{display:flex}
+.global-drop-overlay .drop-zone{border:3px dashed var(--accent);border-radius:20px;padding:60px 80px;text-align:center;color:var(--text);pointer-events:none}
+.global-drop-overlay .drop-zone .icon{font-size:48px;margin-bottom:16px;opacity:.8}
+.global-drop-overlay .drop-zone .hint{font-size:18px;font-weight:500}
 .result{margin-top:16px;padding:16px;background:var(--surface);border-radius:var(--radius);display:none}
 .result.show{display:block}
-.result img{max-width:100%;border-radius:var(--radius);margin-top:8px}
+.result img{max-width:100%;max-height:512px;border-radius:var(--radius);margin-top:8px;object-fit:contain}
 .result pre{font-size:12px;color:var(--text2);white-space:pre-wrap;word-break:break-all;margin-top:8px}
 .gallery{display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:12px}
 .gallery-item{position:relative;border-radius:var(--radius);overflow:hidden;background:var(--surface);cursor:pointer;aspect-ratio:1}
@@ -92,8 +104,14 @@ textarea{min-height:160px;font-family:monospace;font-size:13px;resize:vertical}
 @keyframes spin{to{transform:rotate(360deg)}}
 .modal-overlay{display:none;position:fixed;inset:0;background:#000a;z-index:100;align-items:center;justify-content:center}
 .modal-overlay.show{display:flex}
-.modal-overlay img{max-width:90vw;max-height:90vh;border-radius:var(--radius)}
+.modal-content{display:flex;flex-direction:column;align-items:center;max-height:90vh;overflow:hidden}
+.modal-overlay img{max-width:90vw;max-height:80vh;border-radius:var(--radius);object-fit:contain}
+#modalMeta{max-width:90vw;overflow:hidden}
+#modalPrompt{max-height:20vh;overflow-y:auto}
 .empty{text-align:center;color:var(--text2);padding:60px 0;font-size:14px}
+.footer{text-align:center;padding:32px 24px;color:var(--text2);font-size:13px;border-top:1px solid #ffffff10;margin-top:24px}
+.footer .name{font-size:15px;color:var(--text);font-weight:600;margin-bottom:4px}
+.footer .slogan{font-style:italic;color:#ffffff40}
 .progress-panel{margin-top:16px;padding:20px;background:var(--surface);border-radius:var(--radius);border-left:3px solid var(--accent);display:none}
 .progress-panel.show{display:block}
 .progress-steps{display:flex;flex-direction:column;gap:10px}
@@ -109,19 +127,29 @@ textarea{min-height:160px;font-family:monospace;font-size:13px;resize:vertical}
 .progress-timer .dots{display:inline-block;width:4px;height:4px;border-radius:50%;background:var(--accent);animation:blink 1s ease-in-out infinite}
 @keyframes pulse{0%,100%{opacity:1}50%{opacity:.5}}
 @keyframes blink{0%,100%{opacity:1}50%{opacity:.3}}
+.hist-item{display:flex;gap:12px;padding:12px;background:var(--surface);border-radius:var(--radius);margin-bottom:8px;align-items:center}
+.hist-item img{width:64px;height:64px;object-fit:cover;border-radius:6px;flex-shrink:0}
+.hist-item .info{flex:1;min-width:0}
+.hist-item .prompt{font-size:14px;color:var(--text);margin-bottom:4px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.hist-item .meta{font-size:12px;color:var(--text2);display:flex;gap:12px;flex-wrap:wrap}
+.hist-item .meta span{white-space:nowrap}
+.checkbox-label{display:flex;align-items:center;gap:8px;cursor:pointer;font-size:14px}
+.checkbox-label input[type=checkbox]{width:auto;accent-color:var(--accent);cursor:pointer}
+.checkbox-hint{font-size:11px;color:var(--text2)}
 </style>
 </head>
 <body>
 
 <div class="header">
-  <h1>huaimg</h1>
-  <div class="status"><span class="dot"></span><span id="serverStatus">检查中...</span></div>
+  <h1>hua-img</h1>
+  <div class="status"><span style="font-size:12px;color:var(--text2);margin-right:12px">花下客</span><span class="dot"></span><span id="serverStatus">检查中...</span></div>
 </div>
 
 <div class="tabs">
   <div class="tab active" data-tab="generate">生成图片</div>
   <div class="tab" data-tab="batch">批量生成</div>
   <div class="tab" data-tab="gallery">图片画廊</div>
+  <div class="tab" data-tab="history">历史记录</div>
   <div class="tab" data-tab="status">后端状态</div>
 </div>
 
@@ -130,20 +158,29 @@ textarea{min-height:160px;font-family:monospace;font-size:13px;resize:vertical}
   <!-- Generate -->
   <div class="panel active" id="panel-generate">
     <div class="field">
-      <label>提示词 (Prompt)</label>
-      <input type="text" id="prompt" placeholder="描述你想要生成的图片...">
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:6px">
+        <label style="margin:0">提示词 (Prompt)</label>
+        <button class="btn btn-secondary" id="btnRefine" onclick="doRefine()" style="padding:6px 16px;font-size:13px">润色</button>
+      </div>
+      <textarea id="prompt" placeholder="描述你想要生成的图片..." rows="5"></textarea>
     </div>
     <div class="row">
       <div class="field">
-        <label>风格 (Style)</label>
-        <input type="text" id="style" placeholder="如：水彩画风、赛博朋克...">
+        <label>比例</label>
+        <select id="ratio">
+          <option value="1:1">1:1 (正方形)</option>
+          <option value="16:9">16:9 (横屏)</option>
+          <option value="9:16">9:16 (竖屏)</option>
+          <option value="4:3">4:3</option>
+          <option value="3:4">3:4</option>
+        </select>
       </div>
       <div class="field">
-        <label>模式</label>
+        <label>模式 <span style="font-size:11px;color:var(--text2)">(通常无需切换)</span></label>
         <select id="mode">
-          <option value="auto">auto</option>
-          <option value="cli">cli</option>
-          <option value="http">http</option>
+          <option value="auto">auto (自动选择)</option>
+          <option value="cli">cli (命令行)</option>
+          <option value="http">http (HTTP服务)</option>
         </select>
       </div>
     </div>
@@ -151,8 +188,8 @@ textarea{min-height:160px;font-family:monospace;font-size:13px;resize:vertical}
       <label>参考图 (可选，可多选)</label>
       <div class="file-drop" id="fileDrop">
         <input type="file" id="refFiles" multiple accept="image/*">
-        <div>点击选择或拖拽图片到此处</div>
-        <div id="fileNames" style="margin-top:8px;font-size:12px"></div>
+        <div id="fileDropHint">点击选择或拖拽图片到此处</div>
+        <div id="fileNames" style="margin-top:8px;display:none"></div>
       </div>
     </div>
     <button class="btn btn-primary" id="btnGenerate" onclick="doGenerate()">生成图片</button>
@@ -165,7 +202,10 @@ textarea{min-height:160px;font-family:monospace;font-size:13px;resize:vertical}
       <div class="progress-timer"><span class="dots"></span><span id="timerText">准备中...</span></div>
     </div>
     <div class="result" id="generateResult">
-      <pre id="generateResultText"></pre>
+      <div style="display:flex;align-items:center;gap:12px;flex-wrap:wrap">
+        <pre id="generateResultText" style="margin:0"></pre>
+        <a id="downloadBtn" class="btn btn-secondary" href="#" download style="display:none;text-decoration:none">下载图片</a>
+      </div>
       <img id="generateResultImg" style="display:none">
     </div>
   </div>
@@ -192,6 +232,7 @@ textarea{min-height:160px;font-family:monospace;font-size:13px;resize:vertical}
       <div class="progress-timer"><span class="dots"></span><span id="batchTimerText">准备中...</span></div>
     </div>
     <div class="result" id="batchResult">
+      <div id="batchResultImages"></div>
       <pre id="batchResultText"></pre>
     </div>
   </div>
@@ -206,6 +247,16 @@ textarea{min-height:160px;font-family:monospace;font-size:13px;resize:vertical}
     <div class="empty" id="galleryEmpty" style="display:none">暂无图片</div>
   </div>
 
+  <!-- History -->
+  <div class="panel" id="panel-history">
+    <div style="margin-bottom:16px;display:flex;justify-content:space-between;align-items:center">
+      <h3 style="font-size:15px">生成历史</h3>
+      <button class="btn btn-secondary" onclick="loadHistory()">刷新</button>
+    </div>
+    <div id="historyList"></div>
+    <div class="empty" id="historyEmpty" style="display:none">暂无记录</div>
+  </div>
+
   <!-- Status -->
   <div class="panel" id="panel-status">
     <button class="btn btn-secondary" onclick="loadStatus()" style="margin-bottom:16px">刷新状态</button>
@@ -217,8 +268,26 @@ textarea{min-height:160px;font-family:monospace;font-size:13px;resize:vertical}
 
 </div>
 
+<div class="footer">
+  <div class="name">花下客</div>
+  <div class="slogan">以花为伴，以图为言</div>
+</div>
+
+<div class="global-drop-overlay" id="globalDropOverlay">
+  <div class="drop-zone">
+    <div class="icon">📁</div>
+    <div class="hint">松开鼠标上传图片</div>
+  </div>
+</div>
+
 <div class="modal-overlay" id="modal" onclick="this.classList.remove('show')">
-  <img id="modalImg">
+  <div class="modal-content" onclick="event.stopPropagation()">
+    <img id="modalImg">
+    <div id="modalMeta" style="display:none">
+      <div id="modalPrompt" style="margin-top:12px;padding:12px;background:var(--surface);border-radius:var(--radius);font-size:14px;line-height:1.6"></div>
+    </div>
+    <a id="modalDownload" class="btn btn-secondary" href="#" download style="margin-top:12px;text-decoration:none;display:none">下载图片</a>
+  </div>
 </div>
 
 <script>
@@ -233,27 +302,82 @@ $$('.tab').forEach(t => t.onclick = () => {
   t.classList.add('active');
   $(`#panel-${t.dataset.tab}`).classList.add('active');
   if (t.dataset.tab === 'gallery') loadGallery();
+  if (t.dataset.tab === 'history') loadHistory();
   if (t.dataset.tab === 'status') loadStatus();
 });
 
 // File drop
 const drop = $('#fileDrop');
 const fileInput = $('#refFiles');
-drop.onclick = () => fileInput.click();
+drop.onclick = e => { if (e.target === drop || e.target === $('#fileDropHint')) fileInput.click(); };
 drop.ondragover = e => { e.preventDefault(); drop.classList.add('dragover'); };
 drop.ondragleave = () => drop.classList.remove('dragover');
 drop.ondrop = e => { e.preventDefault(); drop.classList.remove('dragover'); handleFiles(e.dataTransfer.files); };
 fileInput.onchange = () => handleFiles(fileInput.files);
+
+// Global drag & drop (拖到页面任意位置都能上传)
+let dragCounter = 0;
+const overlay = $('#globalDropOverlay');
+document.addEventListener('dragenter', e => {
+  e.preventDefault();
+  if (e.dataTransfer.types.includes('Files')) {
+    dragCounter++;
+    overlay.classList.add('show');
+  }
+});
+document.addEventListener('dragleave', e => {
+  e.preventDefault();
+  dragCounter--;
+  if (dragCounter <= 0) {
+    dragCounter = 0;
+    overlay.classList.remove('show');
+  }
+});
+document.addEventListener('dragover', e => { e.preventDefault(); });
+document.addEventListener('drop', e => {
+  e.preventDefault();
+  dragCounter = 0;
+  overlay.classList.remove('show');
+  if (e.dataTransfer.files.length > 0) {
+    handleFiles(e.dataTransfer.files);
+    // 自动切换到生成图片标签页
+    const genTab = document.querySelector('.tab[data-tab="generate"]');
+    if (genTab && !genTab.classList.contains('active')) genTab.click();
+  }
+});
 function handleFiles(files) {
   for (const f of files) {
     if (!selectedFiles.some(s => s.name === f.name && s.size === f.size)) {
       selectedFiles.push(f);
     }
   }
-  updateFileNames();
+  updateFilePreviews();
 }
-function updateFileNames() {
-  $('#fileNames').textContent = selectedFiles.map(f => f.name).join(', ') || '未选择文件';
+function removeFile(idx) {
+  selectedFiles.splice(idx, 1);
+  updateFilePreviews();
+}
+function updateFilePreviews() {
+  const el = $('#fileNames');
+  const hint = $('#fileDropHint');
+  if (selectedFiles.length === 0) {
+    el.innerHTML = '';
+    el.style.display = 'none';
+    hint.style.display = '';
+    return;
+  }
+  hint.style.display = 'none';
+  el.style.display = 'flex';
+  el.style.gap = '8px';
+  el.style.flexWrap = 'wrap';
+  el.style.justifyContent = 'center';
+  el.innerHTML = selectedFiles.map((f, i) => {
+    const url = URL.createObjectURL(f);
+    return '<div style="position:relative;display:inline-block">' +
+      '<img src="' + url + '" style="width:64px;height:64px;object-fit:cover;border-radius:6px;border:1px solid #ffffff20">' +
+      '<span onclick="event.stopPropagation();removeFile(' + i + ')" style="position:absolute;top:-6px;right:-6px;width:18px;height:18px;border-radius:50%;background:var(--accent);color:#fff;font-size:11px;display:flex;align-items:center;justify-content:center;cursor:pointer;line-height:1">&times;</span>' +
+      '</div>';
+  }).join('');
 }
 
 // Health check
@@ -263,6 +387,35 @@ fetch('/api/health').then(r => r.json()).then(d => {
   $('#serverStatus').textContent = '连接失败';
   document.querySelector('.dot').style.background = '#e94560';
 });
+
+// Refine
+async function doRefine() {
+  const prompt = $('#prompt').value.trim();
+  if (!prompt) { alert('请先输入提示词'); return; }
+  const btn = $('#btnRefine');
+  btn.disabled = true;
+  btn.innerHTML = '<span class="loading" style="width:14px;height:14px"></span>';
+
+  const fd = new FormData();
+  fd.append('prompt', prompt);
+  fd.append('ratio', $('#ratio').value);
+  for (const f of selectedFiles) fd.append('images', f);
+
+  try {
+    const res = await fetch('/api/refine', { method: 'POST', body: fd });
+    const data = await res.json();
+    if (data.success && data.refined_prompt) {
+      $('#prompt').value = data.refined_prompt;
+    } else {
+      alert(data.error || '润色失败');
+    }
+  } catch (e) {
+    alert('请求失败: ' + e.message);
+  } finally {
+    btn.disabled = false;
+    btn.textContent = '润色';
+  }
+}
 
 // Generate
 let generateTimer = null;
@@ -290,7 +443,7 @@ async function doGenerate() {
   const prompt = $('#prompt').value.trim();
   if (!prompt) { alert('请输入提示词'); return; }
   const btn = $('#btnGenerate');
-  const inputs = [$('#prompt'), $('#style'), $('#mode')];
+  const inputs = [$('#prompt'), $('#ratio'), $('#mode')];
 
   // Disable UI
   btn.disabled = true;
@@ -305,7 +458,7 @@ async function doGenerate() {
 
   const fd = new FormData();
   fd.append('prompt', prompt);
-  fd.append('style', $('#style').value);
+  fd.append('ratio', $('#ratio').value);
   fd.append('mode', $('#mode').value);
   for (const f of selectedFiles) fd.append('images', f);
 
@@ -322,13 +475,18 @@ async function doGenerate() {
     stopProgress();
     const elapsed = $('#timerText').textContent;
     $('#generateResult').classList.add('show');
-    $('#generateResultText').textContent = (data.success ? '✓ 生成成功 (' + elapsed + ')\n\n' : '') + JSON.stringify(data, null, 2);
     const img = $('#generateResultImg');
+    const dlBtn = $('#downloadBtn');
     if (data.success && data.download_url) {
       img.src = data.download_url + '?t=' + Date.now();
       img.style.display = 'block';
+      dlBtn.href = data.download_url;
+      dlBtn.style.display = 'inline-block';
+      $('#generateResultText').textContent = '生成成功 (' + elapsed + ')';
     } else {
       img.style.display = 'none';
+      dlBtn.style.display = 'none';
+      $('#generateResultText').textContent = data.error || JSON.stringify(data, null, 2);
     }
   } catch (e) {
     setStep('step-generate', 'error');
@@ -336,6 +494,7 @@ async function doGenerate() {
     $('#generateResult').classList.add('show');
     $('#generateResultText').textContent = '请求失败: ' + e.message;
     $('#generateResultImg').style.display = 'none';
+    $('#downloadBtn').style.display = 'none';
   } finally {
     btn.disabled = false;
     btn.classList.remove('btn-loading');
@@ -379,7 +538,41 @@ async function doBatch() {
     stopProgress();
     const elapsed = $('#batchTimerText').textContent;
     $('#batchResult').classList.add('show');
-    $('#batchResultText').textContent = (success ? '✓ 批量生成完成 (' + elapsed + ')\n\n' : '') + JSON.stringify(result, null, 2);
+
+    const imagesDiv = $('#batchResultImages');
+    const pre = $('#batchResultText');
+    imagesDiv.innerHTML = '';
+    pre.textContent = '';
+
+    if (success && result.results && result.results.length > 0) {
+      const statusText = document.createElement('div');
+      statusText.style.cssText = 'margin-bottom:12px;font-size:13px;color:var(--text2)';
+      statusText.textContent = '✓ 批量生成完成 (' + elapsed + ')';
+      imagesDiv.appendChild(statusText);
+
+      const grid = document.createElement('div');
+      grid.className = 'gallery';
+      for (const r of result.results) {
+        const item = document.createElement('div');
+        item.className = 'gallery-item';
+        if (r.success && r.download_url) {
+          item.dataset.img = JSON.stringify({ url: r.download_url, prompt: r.prompt || r.id || '' });
+          item.onclick = () => showModal(item);
+          const img = document.createElement('img');
+          img.src = r.download_url;
+          img.loading = 'lazy';
+          img.alt = r.id || 'image';
+          item.appendChild(img);
+        } else {
+          item.style.cssText = 'display:flex;align-items:center;justify-content:center;aspect-ratio:1;background:var(--surface);color:var(--accent);font-size:12px;text-align:center;padding:8px';
+          item.textContent = (r.id || '') + '\n' + (r.error || '生成失败');
+        }
+        grid.appendChild(item);
+      }
+      imagesDiv.appendChild(grid);
+    } else {
+      pre.textContent = JSON.stringify(result, null, 2);
+    }
   } catch (e) {
     setStep('bstep-generate', 'error');
     stopProgress();
@@ -407,7 +600,7 @@ async function loadGallery() {
     }
     empty.style.display = 'none';
     grid.innerHTML = data.images.map(img => `
-      <div class="gallery-item" onclick="showModal('${img.url}')">
+      <div class="gallery-item" onclick="showModal(this)" data-img='${JSON.stringify(img).replace(/'/g, "&#39;")}'>
         <img src="${img.url}" loading="lazy" alt="${img.filename}">
       </div>
     `).join('');
@@ -416,9 +609,74 @@ async function loadGallery() {
   }
 }
 
-function showModal(url) {
-  $('#modalImg').src = url;
+function showModal(el) {
+  const img = JSON.parse(el.dataset.img);
+  showModalData(img);
+}
+
+function showModalFromData(el) {
+  const img = JSON.parse(el.dataset.img);
+  showModalData(img);
+}
+
+function showModalData(img) {
+  $('#modalImg').src = img.url;
+  const dl = $('#modalDownload');
+  if (img.url) { dl.href = img.url; dl.style.display = 'inline-block'; }
+  else { dl.style.display = 'none'; }
+  const meta = $('#modalMeta');
+  const promptEl = $('#modalPrompt');
+  if (img.prompt) {
+    let html = '<div style="margin-bottom:6px;color:var(--text);font-weight:500">' + img.prompt + '</div>';
+    const tags = [];
+    if (img.ratio) tags.push('比例: ' + img.ratio);
+    if (img.style) tags.push('风格: ' + img.style);
+    if (img.source) tags.push('来源: ' + img.source);
+    if (img.time) {
+      const d = new Date(img.time * 1000);
+      tags.push('时间: ' + d.toLocaleString('zh-CN'));
+    }
+    if (tags.length) html += '<div style="font-size:12px;color:var(--text2);display:flex;gap:12px;flex-wrap:wrap">' + tags.map(t => '<span>' + t + '</span>').join('') + '</div>';
+    promptEl.innerHTML = html;
+    meta.style.display = 'block';
+  } else {
+    meta.style.display = 'none';
+  }
   $('#modal').classList.add('show');
+}
+
+// History
+async function loadHistory() {
+  try {
+    const res = await fetch('/api/history');
+    const data = await res.json();
+    const list = $('#historyList');
+    const empty = $('#historyEmpty');
+    if (!data.records || data.records.length === 0) {
+      list.innerHTML = '';
+      empty.style.display = 'block';
+      return;
+    }
+    empty.style.display = 'none';
+    list.innerHTML = data.records.map(r => {
+      const imgUrl = r.image ? '/api/images/' + r.image : '';
+      const time = r.time ? new Date(r.time * 1000).toLocaleString('zh-CN') : '';
+      const tags = [];
+      if (r.ratio) tags.push(r.ratio);
+      if (r.style) tags.push(r.style);
+      if (r.source) tags.push(r.source);
+      const imgData = imgUrl ? JSON.stringify({url: imgUrl, prompt: r.prompt || '', ratio: r.ratio, style: r.style, source: r.source, time: r.time}).replace(/'/g, "&#39;") : '';
+      return '<div class="hist-item">' +
+        (imgUrl ? '<img src="' + imgUrl + '" loading="lazy" style="cursor:pointer" onclick="showModalFromData(this)" data-img=\'' + imgData + '\'>' : '') +
+        '<div class="info">' +
+          '<div class="prompt">' + (r.prompt || '-') + '</div>' +
+          '<div class="meta"><span>' + time + '</span>' + tags.map(t => '<span>' + t + '</span>').join('') + '</div>' +
+        '</div>' +
+      '</div>';
+    }).join('');
+  } catch {
+    $('#historyList').innerHTML = '<div class="empty">加载失败</div>';
+  }
 }
 
 // Status
@@ -547,11 +805,11 @@ def _copy_into_api_output(source: Path, destination: Path) -> Path:
 
 
 def _log_exception(context: str, exc: BaseException) -> None:
-    print(f"[huaimg-api] {context}: {type(exc).__name__}: {exc}", flush=True)
+    print(f"[hua-img-api] {context}: {type(exc).__name__}: {exc}", flush=True)
     traceback.print_exc()
 
 
-class HuaimgHandler(BaseHTTPRequestHandler):
+class HuaImgHandler(BaseHTTPRequestHandler):
     # Silence per-request logs; we log start/stop manually.
     def log_message(self, fmt: str, *args: object) -> None:
         pass
@@ -582,6 +840,8 @@ class HuaimgHandler(BaseHTTPRequestHandler):
             self._handle_debug_routes()
         elif parsed.path == "/api/images/list":
             self._handle_image_list()
+        elif parsed.path == "/api/history":
+            self._handle_history()
         elif parsed.path.startswith("/api/images/"):
             self._handle_image_download(parsed.path)
         else:
@@ -597,20 +857,59 @@ class HuaimgHandler(BaseHTTPRequestHandler):
 
     def _handle_image_list(self) -> None:
         _ensure_output_dir()
+
+        # Build filename -> history record mapping
+        hist_map: dict[str, dict] = {}
+        if HISTORY_FILE.exists():
+            for line in HISTORY_FILE.read_text(encoding="utf-8").splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                    img = rec.get("image", "")
+                    if img:
+                        hist_map[Path(img).name] = rec
+                except json.JSONDecodeError:
+                    pass
+
         images = []
         for f in OUTPUT_DIR.rglob("*"):
             if f.is_file() and f.suffix.lower() in (".png", ".jpg", ".jpeg", ".webp"):
                 rel = f.relative_to(OUTPUT_DIR)
-                images.append({
+                info: dict[str, object] = {
                     "filename": f.name,
                     "url": f"/api/images/{rel.as_posix()}",
                     "size": f.stat().st_size,
                     "mtime": f.stat().st_mtime,
-                })
+                }
+                rec = hist_map.get(f.name)
+                if rec:
+                    info["prompt"] = rec.get("prompt", "")
+                    info["ratio"] = rec.get("ratio")
+                    info["style"] = rec.get("style")
+                    info["time"] = rec.get("time")
+                    info["source"] = rec.get("source")
+                images.append(info)
         _json_response(self, 200, {"images": images})
 
+    def _handle_history(self) -> None:
+        if not HISTORY_FILE.exists():
+            _json_response(self, 200, {"records": []})
+            return
+        records = []
+        for line in HISTORY_FILE.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if line:
+                try:
+                    records.append(json.loads(line))
+                except json.JSONDecodeError:
+                    pass
+        records.reverse()
+        _json_response(self, 200, {"records": records})
+
     def _handle_health(self) -> None:
-        _json_response(self, 200, {"status": "ok", "service": "huaimg-api"})
+        _json_response(self, 200, {"status": "ok", "service": "hua-img-api"})
 
     def _handle_probe(self) -> None:
         result = probe_backends()
@@ -627,13 +926,13 @@ class HuaimgHandler(BaseHTTPRequestHandler):
                         "id": "gpt-image-2",
                         "object": "model",
                         "created": 0,
-                        "owned_by": "huaimg",
+                        "owned_by": "hua-img",
                     },
                     {
                         "id": "gpt-image-1",
                         "object": "model",
                         "created": 0,
-                        "owned_by": "huaimg",
+                        "owned_by": "hua-img",
                     },
                 ],
             },
@@ -645,9 +944,10 @@ class HuaimgHandler(BaseHTTPRequestHandler):
             200,
             {
                 "source": str(Path(__file__).resolve()),
-                "debug": os.getenv("HUAIMG_DEBUG", "0"),
+                "debug": os.getenv("HUA_IMG_DEBUG", "0"),
                 "post_routes": [
                     "/api/generate",
+                    "/api/refine",
                     "/v1/images/generations",
                     "/api/storyboard",
                     "/api/upload",
@@ -655,6 +955,59 @@ class HuaimgHandler(BaseHTTPRequestHandler):
                 "do_post_source": inspect.getsource(self.do_POST),
             },
         )
+
+    def _handle_refine(self) -> None:
+        content_type = self.headers.get("Content-Type", "")
+        _debug("/api/refine request received")
+
+        try:
+            prompt: str = ""
+            ratio: str | None = None
+            references: list[Path] = []
+            temp_files: list[Path] = []
+
+            if "multipart/form-data" in content_type:
+                boundary_match = re.search(r"boundary=(?:(?:\"([^\"]+)\")|([^;\s]+))", content_type)
+                if not boundary_match:
+                    raise ValueError("Could not parse multipart boundary")
+                boundary = boundary_match.group(1) or boundary_match.group(2)
+                body = self._read_body()
+                fields, files = _parse_multipart(body, boundary)
+
+                prompt = fields.get("prompt", "").strip()
+                if not prompt:
+                    raise ValueError("prompt is required")
+                ratio = fields.get("ratio")
+
+                for _, fname, fdata in files:
+                    suffix = Path(fname).suffix or ".png"
+                    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
+                    tmp.write(fdata)
+                    tmp.close()
+                    tmp_path = Path(tmp.name)
+                    temp_files.append(tmp_path)
+                    references.append(tmp_path)
+            else:
+                _json_response(self, 400, {"success": False, "error": "Use multipart/form-data"})
+                return
+
+            refined = refine_prompt(prompt, references, ratio=ratio)
+
+            # Clean up temp files
+            for tmp in temp_files:
+                try:
+                    tmp.unlink(missing_ok=True)
+                except OSError:
+                    pass
+
+            if refined and refined != prompt:
+                _json_response(self, 200, {"success": True, "refined_prompt": refined})
+            else:
+                _json_response(self, 200, {"success": False, "error": "润色失败，使用原始提示词"})
+
+        except Exception as e:
+            _log_exception("/api/refine failed", e)
+            _json_response(self, 500, {"success": False, "error": str(e)})
 
     def _handle_image_download(self, path: str) -> None:
         # Extract everything after /api/images/
@@ -689,6 +1042,8 @@ class HuaimgHandler(BaseHTTPRequestHandler):
         _debug(f"POST {parsed.path}")
         if parsed.path == "/api/generate":
             self._handle_generate()
+        elif parsed.path == "/api/refine":
+            self._handle_refine()
         elif parsed.path == "/v1/images/generations":
             self._handle_openai_image_generation()
         elif parsed.path == "/api/storyboard":
@@ -712,8 +1067,10 @@ class HuaimgHandler(BaseHTTPRequestHandler):
         try:
             prompt: str = ""
             style: str | None = None
+            ratio: str | None = None
             mode: str = "auto"
-            timeout: int = 180
+            timeout: int = 600
+            refine: bool = False
             references: list[Path] = []
             temp_files: list[Path] = []
 
@@ -724,8 +1081,10 @@ class HuaimgHandler(BaseHTTPRequestHandler):
                 if not prompt:
                     raise ValueError("prompt is required")
                 style = data.get("style")
+                ratio = data.get("ratio")
                 mode = str(data.get("mode", "auto"))
-                timeout = int(data.get("timeout", 180))
+                timeout = int(data.get("timeout", 600))
+                refine = bool(data.get("refine", False))
                 for ref in data.get("references", []):
                     p = Path(str(ref))
                     if not p.exists():
@@ -744,8 +1103,10 @@ class HuaimgHandler(BaseHTTPRequestHandler):
                 if not prompt:
                     raise ValueError("prompt is required")
                 style = fields.get("style")
+                ratio = fields.get("ratio")
                 mode = fields.get("mode", "auto")
-                timeout = int(fields.get("timeout", "180"))
+                timeout = int(fields.get("timeout", "600"))
+                refine = fields.get("refine", "0") in ("1", "true", "on")
 
                 for _, fname, fdata in files:
                     suffix = Path(fname).suffix or ".png"
@@ -771,7 +1132,9 @@ class HuaimgHandler(BaseHTTPRequestHandler):
                 references=references,
                 output=output_path,
                 style=style,
+                ratio=ratio,
                 timeout=timeout,
+                refine=refine,
             )
             result = generate_image(request)
 
@@ -783,8 +1146,20 @@ class HuaimgHandler(BaseHTTPRequestHandler):
                     pass
 
             result_dict = result.to_dict()
+            if refine and result.prompt != prompt:
+                result_dict["refined_prompt"] = result.prompt
             if result.success and output_path.exists():
                 result_dict["download_url"] = f"{_base_url(self)}/api/images/{output_filename}"
+                _record_history({
+                    "time": time.time(),
+                    "prompt": prompt,
+                    "refined_prompt": result.prompt if refine and result.prompt != prompt else None,
+                    "ratio": ratio,
+                    "style": style,
+                    "mode": mode,
+                    "image": output_filename,
+                    "source": "generate",
+                })
 
             status = 200 if result.success else 500
             _json_response(self, status, result_dict)
@@ -837,7 +1212,7 @@ class HuaimgHandler(BaseHTTPRequestHandler):
                 return
 
             mode = str(data.get("mode", "auto"))
-            timeout = int(data.get("timeout", 180))
+            timeout = int(data.get("timeout", 600))
             style = data.get("style")
             merged_prompt = _append_openai_options(prompt, data)
             created = int(time.time())
@@ -871,6 +1246,14 @@ class HuaimgHandler(BaseHTTPRequestHandler):
                     downloadable = _copy_into_api_output(image_path, output_path)
                     image_items.append({
                         "url": f"{_base_url(self)}/api/images/{downloadable.name}"
+                    })
+                    _record_history({
+                        "time": time.time(),
+                        "prompt": prompt,
+                        "style": style,
+                        "mode": mode,
+                        "image": downloadable.name,
+                        "source": "openai",
                     })
 
             _debug(f"OpenAI-compatible generation completed: {len(image_items)} image(s)")
@@ -911,7 +1294,7 @@ class HuaimgHandler(BaseHTTPRequestHandler):
                 raise ValueError("Request body must be a JSON object")
 
             mode = str(data.get("mode", "auto"))
-            timeout = int(data.get("timeout", 180))
+            timeout = int(data.get("timeout", 600))
             output_dir = data.get("output_dir")
             resolved_output_dir = Path(str(output_dir)) if output_dir else OUTPUT_DIR / f"storyboard-{uuid.uuid4().hex[:8]}"
 
@@ -936,6 +1319,16 @@ class HuaimgHandler(BaseHTTPRequestHandler):
                         except ValueError:
                             rel = out_path.name
                         r["download_url"] = f"{_base_url(self)}/api/images/{rel.as_posix()}"
+                        _record_history({
+                            "time": time.time(),
+                            "prompt": r.get("prompt", ""),
+                            "ratio": r.get("ratio"),
+                            "style": r.get("style"),
+                            "mode": mode,
+                            "image": rel.as_posix() if isinstance(rel, Path) else rel,
+                            "source": "storyboard",
+                            "id": r.get("id"),
+                        })
 
             _json_response(self, 200, {"success": True, "results": results})
 
@@ -1013,20 +1406,21 @@ def _resolve_storyboard_refs(data: dict) -> dict:
 
 
 def serve(host: str | None = None, port: int | None = None, debug: bool | None = None) -> None:
-    host = host or os.getenv("HUAIMG_HOST", DEFAULT_HOST)
-    port = port or int(os.getenv("HUAIMG_PORT", str(DEFAULT_PORT)))
+    host = host or os.getenv("HUA_IMG_HOST", DEFAULT_HOST)
+    port = port or int(os.getenv("HUA_IMG_PORT", str(DEFAULT_PORT)))
     if debug is not None:
-        os.environ["HUAIMG_DEBUG"] = "1" if debug else "0"
+        os.environ["HUA_IMG_DEBUG"] = "1" if debug else "0"
     _ensure_output_dir()
 
-    server = ThreadingHTTPServer((host, port), HuaimgHandler)
-    print(f"[huaimg-api] Web UI:  http://{host}:{port}/")
-    print(f"[huaimg-api] API:     http://{host}:{port}/api/")
+    server = ThreadingHTTPServer((host, port), HuaImgHandler)
+    print(f"[hua-img-api] 花下客 — 以花为伴，以图为言")
+    print(f"[hua-img-api] Web UI:  http://{host}:{port}/")
+    print(f"[hua-img-api] API:     http://{host}:{port}/api/")
     if _debug_enabled():
-        print(f"[huaimg-api] Source:  {Path(__file__).resolve()}")
-        print(f"[huaimg-api] Debug:   {os.getenv('HUAIMG_DEBUG', '0')}")
-        print(f"[huaimg-api] do_POST: {inspect.getsource(HuaimgHandler.do_POST).strip().replace(chr(10), ' ')}")
-    print(f"[huaimg-api] Endpoints:")
+        print(f"[hua-img-api] Source:  {Path(__file__).resolve()}")
+        print(f"[hua-img-api] Debug:   {os.getenv('HUA_IMG_DEBUG', '0')}")
+        print(f"[hua-img-api] do_POST: {inspect.getsource(HuaImgHandler.do_POST).strip().replace(chr(10), ' ')}")
+    print(f"[hua-img-api] Endpoints:")
     print(f"  GET  /                 Web UI")
     print(f"  GET  /api/health       Health check")
     print(f"  GET  /api/probe        Backend probe")
@@ -1039,11 +1433,11 @@ def serve(host: str | None = None, port: int | None = None, debug: bool | None =
     print(f"  POST /v1/images/generations  OpenAI-compatible image generation")
     print(f"  POST /api/storyboard   Batch generation (JSON)")
     print(f"  POST /api/upload       Upload file (multipart)")
-    print(f"[huaimg-api] Output: {OUTPUT_DIR.resolve()}")
-    print(f"[huaimg-api] Ctrl+C to stop")
+    print(f"[hua-img-api] Output: {OUTPUT_DIR.resolve()}")
+    print(f"[hua-img-api] Ctrl+C to stop")
 
     try:
         server.serve_forever()
     except KeyboardInterrupt:
-        print("\n[huaimg-api] Shutting down...")
+        print("\n[hua-img-api] Shutting down...")
         server.shutdown()

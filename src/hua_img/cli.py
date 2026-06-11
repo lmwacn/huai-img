@@ -14,7 +14,7 @@ from .storyboard import run_storyboard
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="huaimg", description="Short-film image generation CLI")
+    parser = argparse.ArgumentParser(prog="hua-img", description="Short-film image generation CLI")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     generate = subparsers.add_parser("generate", help="Generate a single image")
@@ -24,14 +24,14 @@ def build_parser() -> argparse.ArgumentParser:
     generate.add_argument("--style", help="Global style direction")
     generate.add_argument("--mode", choices=["auto", "cli", "http"], default="auto")
     generate.add_argument("--output", type=Path, help="Write output to a file")
-    generate.add_argument("--timeout", type=int, default=180)
+    generate.add_argument("--timeout", type=int, default=600)
     generate.add_argument("--format", choices=["text", "json"], default="text")
 
     storyboard = subparsers.add_parser("storyboard", help="Generate a storyboard batch from JSON")
     storyboard.add_argument("--file", type=Path, required=True, help="Storyboard JSON file")
     storyboard.add_argument("--output-dir", type=Path, help="Output directory for shot files")
     storyboard.add_argument("--mode", choices=["auto", "cli", "http"], default="auto")
-    storyboard.add_argument("--timeout", type=int, default=180)
+    storyboard.add_argument("--timeout", type=int, default=600)
     storyboard.add_argument("--format", choices=["text", "json"], default="text")
 
     probe = subparsers.add_parser("probe", help="Check backend availability")

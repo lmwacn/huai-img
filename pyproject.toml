@@ -3,19 +3,19 @@ requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "huaimg"
+name = "hua-img"
 version = "0.1.0"
 description = "Cross-platform CLI for short-film and storyboard image generation"
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "MIT" }
 authors = [
-  { name = "Buluu" }
+  { name = "花下客", email = "huaxiake@example.com" }
 ]
 dependencies = []
 
 [project.scripts]
-huaimg = "huaimg.cli:main"
+hua-img = "hua_img.cli:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}

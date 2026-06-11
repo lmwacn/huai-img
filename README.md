@@ -1,6 +1,8 @@
-# huaimg
+# hua-img
 
-huaimg 是一个基于 OpenAI Codex imagegen 的轻量级图片生成工具，提供 CLI、Web UI、原生 REST API 和 OpenAI Images API 兼容接口。它支持单图与批量生成、参考图输入、多种后端模式，并可直接作为 OpenAI 协议的本地图片生成服务接入第三方工具，开箱即用。
+> 花下客出品 — 以花为伴，以图为言
+
+hua-img 是一个基于 OpenAI Codex imagegen 的轻量级图片生成工具，提供 CLI、Web UI、原生 REST API 和 OpenAI Images API 兼容接口。它支持单图与批量生成、参考图输入、多种后端模式，并可直接作为 OpenAI 协议的本地图片生成服务接入第三方工具，开箱即用。
 
 ## 关于
 
@@ -13,13 +15,13 @@ huaimg 是一个基于 OpenAI Codex imagegen 的轻量级图片生成工具，�
 - 不支持批量任务，每次只能生成一张图片
 - 无法被其他设备或程序方便地调用
 
-huaimg 正是为解决这些问题而生。它将 codex 的图片生成能力封装为标准化服务：既可以用简洁的命令和内置 Web 界面快速出图，也可以通过 `/api/generate` 调用原生接口，或通过 `/v1/images/generations` 兼容 OpenAI Images API，让支持 OpenAI 协议的第三方工具直接接入本地图片生成能力。
+hua-img 正是为解决这些问题而生。它将 codex 的图片生成能力封装为标准化服务：既可以用简洁的命令和内置 Web 界面快速出图，也可以通过 `/api/generate` 调用原生接口，或通过 `/v1/images/generations` 兼容 OpenAI Images API，让支持 OpenAI 协议的第三方工具直接接入本地图片生成能力。
 
 ### 核心功能
 
 **单图生成** — 一条命令或一个 HTTP 请求即可生成图片。支持自定义提示词、风格指导和参考图输入，生成结果自动保存并返回下载链接。
 
-**OpenAI 协议兼容** — 提供 `GET /v1/models` 和 `POST /v1/images/generations`，可将 OpenAI SDK 或第三方工具的 `base_url` 指向 huaimg 服务。
+**OpenAI 协议兼容** — 提供 `GET /v1/models` 和 `POST /v1/images/generations`，可将 OpenAI SDK 或第三方工具的 `base_url` 指向 hua-img 服务。
 
 **批量生成** — 通过 JSON 文件定义多个生成任务，支持全局风格和全局参考图。一次性提交，自动逐个处理，适合需要批量出图的工作流。
 
@@ -57,14 +59,14 @@ pip install -e .
 ### 探测后端
 
 ```bash
-huaimg probe
-huaimg probe --format json
+hua-img probe
+hua-img probe --format json
 ```
 
 ### 生成图片
 
 ```bash
-huaimg generate \
+hua-img generate \
   --prompt "rainy neon alley at night" \
   --style "cinematic, 35mm lens, soft haze" \
   --image refs/photo.png \
@@ -74,7 +76,7 @@ huaimg generate \
 从文件读取提示词：
 
 ```bash
-huaimg generate --prompt-file prompt.txt --format json
+hua-img generate --prompt-file prompt.txt --format json
 ```
 
 ### 批量生成
@@ -82,7 +84,7 @@ huaimg generate --prompt-file prompt.txt --format json
 通过 JSON 文件一次提交多个生成任务，支持全局风格和全局参考图。
 
 ```bash
-huaimg storyboard --file batch.json --output-dir outputs/project-01 --format json
+hua-img storyboard --file batch.json --output-dir outputs/project-01 --format json
 ```
 
 示例 `batch.json`：
@@ -104,22 +106,22 @@ huaimg storyboard --file batch.json --output-dir outputs/project-01 --format jso
 
 ```bash
 # 默认绑定 0.0.0.0:9527
-huaimg serve
+hua-img serve
 
 # 指定端口
-huaimg serve --port 9090
+hua-img serve --port 9090
 
 # 指定绑定地址和端口
-huaimg serve --host 192.168.1.100 --port 9090
+hua-img serve --host 192.168.1.100 --port 9090
 
 # 输出详细请求与后端调试日志
-huaimg serve --debug
+hua-img serve --debug
 ```
 
 也可通过环境变量配置：
 
 ```bash
-HUAIMG_HOST=192.168.1.100 HUAIMG_PORT=9090 huaimg serve
+HUA_IMG_HOST=192.168.1.100 HUA_IMG_PORT=9090 hua-img serve
 ```
 
 ### API 端点
@@ -138,7 +140,7 @@ HUAIMG_HOST=192.168.1.100 HUAIMG_PORT=9090 huaimg serve
 调试模式下会额外启用 `GET /__debug/routes`，并输出请求路径、OpenAI 兼容层处理进度和 HTTP 后端原始 payload。也可以通过环境变量开启：
 
 ```bash
-HUAIMG_DEBUG=1 huaimg serve
+HUA_IMG_DEBUG=1 hua-img serve
 ```
 
 ### 调用示例
@@ -186,7 +188,7 @@ curl -X POST http://192.168.1.100:9527/api/generate \
 
 #### OpenAI 兼容接口
 
-huaimg 同时提供 OpenAI Images API 兼容入口，可把 OpenAI SDK 的 `base_url` 指向本服务：
+hua-img 同时提供 OpenAI Images API 兼容入口，可把 OpenAI SDK 的 `base_url` 指向本服务：
 
 ```python
 from openai import OpenAI
@@ -244,9 +246,9 @@ curl -X POST http://127.0.0.1:9527/v1/images/generations \
 | `size` | 兼容字段，会作为提示词约束传给后端 |
 | `quality` | 兼容字段，会作为提示词约束传给后端 |
 | `response_format` | `url` 或 `b64_json`，默认 `url` |
-| `style` | huaimg 扩展字段，风格指导 |
-| `mode` | huaimg 扩展字段，`auto` / `cli` / `http` |
-| `timeout` | huaimg 扩展字段，单张图片生成超时时间 |
+| `style` | hua-img 扩展字段，风格指导 |
+| `mode` | hua-img 扩展字段，`auto` / `cli` / `http` |
+| `timeout` | hua-img 扩展字段，单张图片生成超时时间 |
 
 当前兼容入口仅实现 `POST /v1/images/generations`。`/v1/images/edits`、`/v1/images/variations` 和严格尺寸重采样暂未实现。
 
@@ -289,3 +291,7 @@ HTTP 服务地址通过环境变量 `CODEX_IMAGEGEN_PORT` 指定，默认为 `ht
 ## 许可证
 
 MIT
+
+## 作者
+
+花下客

@@ -20,8 +20,8 @@ class BackendError(RuntimeError):
 
 
 def _debug(message: str) -> None:
-    if os.getenv("HUAIMG_DEBUG", "0").lower() not in ("0", "false", "no", "off"):
-        print(f"[huaimg-backend] {message}", flush=True)
+    if os.getenv("HUA_IMG_DEBUG", "0").lower() not in ("0", "false", "no", "off"):
+        print(f"[hua-img-backend] {message}", flush=True)
 
 
 def _clean_codex_error(output: str) -> str:
@@ -54,7 +54,7 @@ class CliBackend:
             raise BackendError("codex command not found")
 
         before_mtime = latest_generated_image_mtime()
-        wrapper = build_wrapper_prompt(request.prompt, request.style, bool(request.references))
+        wrapper = build_wrapper_prompt(request.prompt, request.style, bool(request.references), request.ratio)
         command = [
             executable,
             "exec",
@@ -69,14 +69,20 @@ class CliBackend:
             command.extend(["--image", str(image)])
         command.append("-")
 
-        completed = subprocess.run(
-            command,
-            input=wrapper,
-            encoding="utf-8",
-            capture_output=True,
-            timeout=request.timeout,
-            shell=os.name == "nt",
-        )
+        try:
+            completed = subprocess.run(
+                command,
+                input=wrapper,
+                encoding="utf-8",
+                capture_output=True,
+                timeout=request.timeout,
+                shell=os.name == "nt",
+            )
+        except subprocess.TimeoutExpired:
+            raise BackendError(
+                f"Image generation timed out after {request.timeout}s. "
+                "Try increasing the timeout or use mode='http' if available."
+            )
         if completed.returncode != 0:
             raw = completed.stderr.strip() or completed.stdout.strip() or "codex exec failed"
             raise BackendError(_clean_codex_error(raw))
@@ -114,7 +120,7 @@ class HttpBackend:
 
     def generate(self, request: GenerateRequest) -> GenerateResult:
         payload: dict[str, object] = {
-            "prompt": merge_style(request.prompt, request.style),
+            "prompt": merge_style(request.prompt, request.style, request.ratio),
             "timeout_sec": request.timeout,
         }
         if request.references:
@@ -235,8 +241,8 @@ def _is_chinese(text: str) -> bool:
     return False
 
 
-def build_wrapper_prompt(prompt: str, style: str | None, has_references: bool) -> str:
-    merged = merge_style(prompt, style)
+def build_wrapper_prompt(prompt: str, style: str | None, has_references: bool, ratio: str | None = None) -> str:
+    merged = merge_style(prompt, style, ratio)
     if _is_chinese(merged):
         instructions = f"使用 imagegen 按以下请求生成一张图片：\n{merged}\n\n要求：\n- 直接生成图片\n- 不要解释\n- 只返回图片结果"
         if has_references:
@@ -263,10 +269,15 @@ def build_wrapper_prompt(prompt: str, style: str | None, has_references: bool) -
     )
 
 
-def merge_style(prompt: str, style: str | None) -> str:
-    if not style:
+def merge_style(prompt: str, style: str | None, ratio: str | None = None) -> str:
+    parts = [prompt]
+    if ratio:
+        parts.append(f"Aspect ratio: {ratio}")
+    if style:
+        parts.append(f"Style direction: {style}")
+    if len(parts) == 1:
         return prompt
-    return f"{prompt}\n\nStyle direction: {style}"
+    return "\n\n".join(parts)
 
 
 def codex_generated_images_dir() -> Path:
@@ -313,3 +324,97 @@ def resolve_codex_executable() -> str | None:
         if resolved:
             return resolved
     return None
+
+
+def refine_prompt(prompt: str, references: list[Path], style: str | None = None, ratio: str | None = None, timeout: int = 180) -> str:
+    """Use Codex to search, analyze, and enhance the user's prompt before image generation."""
+    executable = resolve_codex_executable()
+    if not executable:
+        _debug("codex not available, skipping refine")
+        return prompt
+
+    # Build the refinement prompt
+    context_parts = []
+    if style:
+        context_parts.append(f"风格要求: {style}")
+    if ratio:
+        context_parts.append(f"画面比例: {ratio}")
+    context_info = "\n".join(context_parts) if context_parts else ""
+
+    has_refs = len(references) > 0
+    ref_instruction = ""
+    if has_refs:
+        ref_instruction = """
+参考图已附上，请仔细分析图中的：
+- 视觉风格（画风、色调、光影）
+- 构图特点（视角、布局、景深）
+- 主体元素（人物姿态、表情、服装）
+- 环境氛围（背景、天气、时间）
+将这些特征融入到优化后的提示词中。"""
+
+    refine_instruction = f"""你是一个专业的封面设计提示词工程师，擅长为车评、科技/AI工具、自媒体等内容生成高质量封面图提示词。
+
+用户原始描述：{prompt}
+{context_info}
+{ref_instruction}
+
+请按以下步骤执行：
+
+第一步：分析与搜索
+1. 识别内容类型（车评、AI工具、科技评测、生活分享等）
+2. 搜索并补充专业信息：
+   - 车评类：搜索该车型的设计语言、外观特征（前脸、腰线、轮毂）、品牌配色、目标受众审美
+   - AI/科技类：搜索科技感视觉元素（光效、粒子、线条、全息投影）、极简/未来感设计趋势
+   - 其他类：搜索该领域的视觉风格、配色方案、流行构图
+
+第二步：封面设计优化
+1. 构图原则：确保画面留有标题文字空间（通常上方或左侧）
+2. 视觉层次：主体突出，背景简洁但有氛围感
+3. 吸引力法则：使用对比色、光影焦点、视觉引导线
+4. 平台适配：适合缩略图展示，主体清晰可辨
+
+第三步：输出规则
+1. 保留用户描述中的所有文案内容（引号内的文字、标题、数字等），一字不改
+2. 只润色视觉描述部分（构图、风格、光影、氛围、配色等）
+3. 输出中文，控制在 100-200 字之间
+4. 不要有任何解释、前缀或编号，只输出提示词本身"""
+
+    command = [
+        executable,
+        "exec",
+        "--ephemeral",
+        "--skip-git-repo-check",
+        "--sandbox",
+        "read-only",
+        "--color",
+        "never",
+    ]
+    for ref in references:
+        command.extend(["--image", str(ref)])
+    command.append("-")
+
+    _debug(f"refine_prompt: calling codex with {len(references)} reference(s)")
+    try:
+        completed = subprocess.run(
+            command,
+            input=refine_instruction,
+            encoding="utf-8",
+            capture_output=True,
+            timeout=timeout,
+            shell=os.name == "nt",
+        )
+        if completed.returncode != 0:
+            _debug(f"refine_prompt failed: {completed.stderr[:200]}")
+            return prompt
+
+        refined = completed.stdout.strip()
+        if not refined or len(refined) < 10:
+            _debug("refine_prompt: output too short, using original")
+            return prompt
+
+        _debug(f"refine_prompt success: {refined[:100]}...")
+        return refined
+
+    except (subprocess.TimeoutExpired, Exception) as e:
+        _debug(f"refine_prompt error: {e}")
+        return prompt
